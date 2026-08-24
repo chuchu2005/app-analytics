@@ -66,5 +66,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
 
-# Run migrations and start server
-CMD ["sh", "-c", "tsx dist/scripts/migrate.js && tsx basic-server.ts"]
+# Start server. No separate migrate step: createServer() calls
+# initializeDatabase(), which applies the full idempotent schema
+# (CREATE TABLE IF NOT EXISTS + conditional ALTERs). Running migrate.js
+# first would repeat every DDL round-trip and double cold-start time
+# against a remote DB.
+CMD ["sh", "-c", "tsx basic-server.ts"]

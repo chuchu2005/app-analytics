@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "linkforty-core",
+  "main": "cloudflare/index.ts",
+  "compatibility_date": "2026-01-10",
+
+  "containers": [
+    {
+      "class_name": "LinkFortyContainer",
+      "image": "./Dockerfile",
+      "instance_type": "basic",
+      "max_instances": 8
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LINKFORTY",
+        "class_name": "LinkFortyContainer"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LinkFortyContainer"]
+    }
+  ]
+}

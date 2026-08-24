@@ -14,9 +14,10 @@ async function start() {
     database: {
       url: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/linkforty',
     },
-    redis: {
-      url: process.env.REDIS_URL || 'redis://localhost:6379',
-    },
+    // Without REDIS_URL, register no redis plugin at all. A localhost
+    // fallback is worse than none: unreachable Redis stalls @fastify/redis
+    // until Fastify's pluginTimeout and kills boot in container runtimes.
+    ...(process.env.REDIS_URL ? { redis: { url: process.env.REDIS_URL } } : {}),
     cors: {
       origin: process.env.CORS_ORIGIN || '*',
     },
