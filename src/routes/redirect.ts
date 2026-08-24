@@ -1,0 +1,692 @@
+import { randomUUID } from 'crypto';
+import { FastifyInstance } from 'fastify';
+import { db } from '../lib/database.js';
+import { getClientIp } from '../lib/client-ip.js';
+import { parseUserAgent, getLocationFromIP, buildRedirectUrl, detectDevice } from '../lib/utils.js';
+import { storeFingerprintForClick, type FingerprintData } from '../lib/fingerprint.js';
+import { emitClickEvent } from '../lib/event-emitter.js';
+import { classifyBot, edgeBotSignal } from '../lib/bot-detection.js';
+import {
+  evaluateLinkSafety,
+  generateWarningLinkHTML,
+  createOwnerSuspensionSelect,
+} from '../lib/link-safety.js';
+
+/**
+ * Detect iOS in-app browsers where Universal Links don't fire.
+ * These browsers use WKWebView which bypasses the Universal Links mechanism.
+ */
+export function isIOSInAppBrowser(userAgent: string): boolean {
+  const inAppPatterns = [
+    /GSA\//i,              // Google Search App (Gmail in-app browser)
+    /Gmail\//i,            // Gmail
+    /FBAN|FBAV/i,          // Facebook
+    /Instagram/i,          // Instagram
+    /Twitter/i,            // Twitter/X
+    /LinkedIn/i,           // LinkedIn
+    /MicroMessenger/i,     // WeChat
+    /Outlook/i,            // Outlook
+    /YahooMobile/i,        // Yahoo Mail
+  ];
+  return inAppPatterns.some(pattern => pattern.test(userAgent));
+}
+
+/**
+ * Detect Android in-app browsers where App Links don't fire.
+ * These browsers use Android WebView (or app-specific webviews) that bypass
+ * the App Link / Digital Asset Link mechanism.
+ */
+export function isAndroidInAppBrowser(userAgent: string): boolean {
+  const inAppPatterns = [
+    /FB_IAB|FBAN|FBAV/i,   // Facebook in-app browser
+    /Instagram/i,
+    /Line\//i,
+    /KAKAOTALK/i,
+    /Twitter/i,
+    /LinkedIn/i,
+    /MicroMessenger/i,     // WeChat
+    /Outlook-Android/i,
+    /WhatsApp/i,
+    /Pinterest/i,
+    /Telegram/i,
+    /Snapchat/i,
+    /\swv\)/,              // Generic Android WebView marker (e.g. "Mobile Safari/537.36; wv)")
+  ];
+  return inAppPatterns.some(pattern => pattern.test(userAgent));
+}
+
+/**
+ * Pick the destination URL for a mobile click that has fallen through the
+ * Universal Link / App Link / app_scheme priority steps. The choice depends on
+ * whether the click is from an in-app browser:
+ *
+ * - Regular browser (Safari, Chrome): the OS-level UL/App Link check ran and
+ *   didn't fire, so the app must not be installed → prefer the App/Play Store URL.
+ *
+ * - In-app browser (Gmail, GSA, FB, Instagram, Outlook, etc.): UL is bypassed
+ *   regardless of install state, so we don't know if the app is installed →
+ *   prefer the web fallback URL, which gives the OS another chance to fire UL
+ *   if the fallback is on the app's UL/App-Link domain.
+ *
+ * Returns null if no URL is available (caller should fall back to original_url).
+ */
+export function pickMobileFallbackUrl(
+  device: 'ios' | 'android',
+  userAgent: string,
+  iosUrl: string | null,
+  androidUrl: string | null,
+  webFallbackUrl: string | null,
+): { url: string; reason: string } | null {
+  const inApp = device === 'ios'
+    ? isIOSInAppBrowser(userAgent)
+    : isAndroidInAppBrowser(userAgent);
+  const storeUrl = device === 'ios' ? iosUrl : androidUrl;
+  const storeReason = device === 'ios' ? 'ios_app_store_url' : 'android_app_store_url';
+
+  if (inApp) {
+    if (webFallbackUrl) return { url: webFallbackUrl, reason: 'web_fallback_url' };
+    if (storeUrl)       return { url: storeUrl,       reason: storeReason };
+  } else {
+    if (storeUrl)       return { url: storeUrl,       reason: storeReason };
+    if (webFallbackUrl) return { url: webFallbackUrl, reason: 'web_fallback_url' };
+  }
+  return null;
+}
+
+/**
+ * Generate an interstitial HTML page that tries to open the app via custom scheme,
+ * then falls back to the App Store / Play Store.
+ *
+ * The JavaScript reads the URL fragment (window.location.hash) and appends it
+ * to the scheme URL. This preserves the E2E encryption key, which lives only
+ * in the fragment and is never sent to the server.
+ */
+function generateInterstitialHTML(schemeUrl: string, fallbackUrl: string, title?: string): string {
+  const safeSchemeUrl = schemeUrl.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const safeFallbackUrl = fallbackUrl.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const safeTitle = (title || 'the app').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  return `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opening ${safeTitle}...</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; color: #111827; text-align: center; }
+  .container { padding: 2rem; }
+  .spinner { width: 40px; height: 40px; border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 1.5rem; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.5rem; }
+  p { font-size: 0.875rem; color: #6b7280; margin: 0 0 2rem; }
+  .btn { display: inline-block; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-size: 0.875rem; font-weight: 500; text-decoration: none; margin: 0.25rem; }
+  .btn-primary { background: #3b82f6; color: #fff; }
+  .btn-secondary { background: #e5e7eb; color: #374151; }
+</style>
+</head><body>
+<div class="container">
+  <div class="spinner"></div>
+  <h1>Opening ${safeTitle}...</h1>
+  <p>If the app doesn't open automatically:</p>
+  <a class="btn btn-primary" id="open-btn" href="${safeSchemeUrl}">Open App</a>
+  <a class="btn btn-secondary" id="store-btn" href="${safeFallbackUrl}">Download App</a>
+</div>
+<script>
+  // Preserve URL fragment (E2E encryption key) through the scheme redirect
+  var hash = window.location.hash || '';
+  var schemeUrl = "${safeSchemeUrl}" + hash;
+  document.getElementById('open-btn').href = schemeUrl;
+  window.location = schemeUrl;
+  setTimeout(function() { window.location.replace("${safeFallbackUrl}"); }, 1500);
+</script>
+</body></html>`;
+}
+
+export interface RedirectRouteOptions {
+  /**
+   * Absolute URL of an abuse-reporting page. When set, the interstitial warning
+   * page links to it. Optional — deployments without one simply omit the link.
+   */
+  abuseReportUrl?: string;
+}
+
+export async function redirectRoutes(
+  fastify: FastifyInstance,
+  options: RedirectRouteOptions = {}
+) {
+  /**
+   * Owner-restriction support is detected rather than assumed.
+   *
+   * The redirect query joins `organizations` for settings, and that table is now
+   * created by this package (#35) — before that fix a stock self-hosted install
+   * 500'd on every redirect with 42P01, which made this probe's guarantee hollow:
+   * it guarded the column while the table itself was missing.
+   *
+   * The column still needs probing separately, because `suspended_at` is added by
+   * downstream consumers that model owner restriction rather than by this package.
+   * Probing once and building the SELECT accordingly avoids failing every redirect
+   * on a missing column.
+   *
+   * Scoped to this registration rather than the module: module-level state would
+   * be shared by every createServer() in the process, so two servers pointed at
+   * different databases would share whichever answer landed first — and it forced
+   * a test-only reset export onto the package's public API.
+   *
+   * The in-flight promise is memoised, not just its result, so N concurrent cold
+   * requests issue one probe rather than N.
+   *
+   * Probed lazily because the database may not be reachable at registration time.
+   * A probe failure is treated as "unsupported", so it can never take the redirect
+   * path down.
+   */
+  const resolveOwnerSuspensionSelect = createOwnerSuspensionSelect({
+    query: (sql) => db.query(sql),
+    onSupported: () =>
+      fastify.log.info('Redirect: owner restriction supported (organizations.suspended_at present)'),
+  });
+  // Helper function to handle the actual redirect logic
+  async function handleRedirect(request: any, reply: any, shortCode: string, templateSlug?: string) {
+    let linkData: string | null = null;
+
+    // Build cache key (include template if present)
+    const cacheKey = templateSlug ? `link:${templateSlug}:${shortCode}` : `link:${shortCode}`;
+
+    // Try to get link from cache if Redis is available
+    if (fastify.redis) {
+      try {
+        linkData = await fastify.redis.get(cacheKey);
+      } catch (error) {
+        fastify.log.warn('Redis cache lookup failed, falling back to database');
+      }
+    }
+
+    if (!linkData) {
+      // Build query based on whether template slug is provided
+      let query: string;
+      let params: any[];
+
+      const ownerSuspensionColumn = await resolveOwnerSuspensionSelect();
+
+      if (templateSlug) {
+        // Template-based URL: verify both template and link match
+        // Also fetch template settings and org settings for URL fallback chain
+        query = `
+          SELECT l.*, t.settings AS template_settings, o.settings AS org_settings
+                 ${ownerSuspensionColumn}
+          FROM links l
+          LEFT JOIN link_templates t ON l.template_id = t.id
+          LEFT JOIN organizations o ON l.organization_id = o.id
+          WHERE l.short_code = $1 AND t.slug = $2
+          AND l.is_active = true
+          AND (l.expires_at IS NULL OR l.expires_at > NOW())
+        `;
+        params = [shortCode, templateSlug];
+      } else {
+        // Legacy URL: just lookup by short code
+        // Also fetch template settings and org settings for URL fallback chain
+        query = `
+          SELECT l.*, t.settings AS template_settings, o.settings AS org_settings
+                 ${ownerSuspensionColumn}
+          FROM links l
+          LEFT JOIN link_templates t ON l.template_id = t.id
+          LEFT JOIN organizations o ON l.organization_id = o.id
+          WHERE l.short_code = $1 AND l.is_active = true
+          AND (l.expires_at IS NULL OR l.expires_at > NOW())
+        `;
+        params = [shortCode];
+      }
+
+      const result = await db.query(query, params);
+
+      if (result.rows.length === 0) {
+        return reply.status(404).send({ error: 'Link not found' });
+      }
+
+      linkData = JSON.stringify(result.rows[0]);
+
+      // Cache for 5 minutes if Redis is available
+      if (fastify.redis) {
+        try {
+          await fastify.redis.setex(cacheKey, 300, linkData);
+        } catch (error) {
+          fastify.log.warn('Redis cache set failed');
+        }
+      }
+    }
+
+    const link = JSON.parse(linkData);
+
+    // Safety gate, applied after the cache read so it covers cached rows too.
+    //
+    // It does NOT close the stale-cache window on its own, and an earlier version
+    // of this comment wrongly claimed it did: a cached row carries the value of
+    // `is_active` as at cache time, so reading it here sees the same stale `true`
+    // the old code did. Staleness is handled by invalidateLinkResolutionCache(),
+    // called when a link is updated or deleted.
+    //
+    // `is_active` therefore stays filtered in SQL — an inactive link never needs
+    // fetching or caching. What genuinely cannot be expressed in the WHERE clause
+    // is `warn_at`, which needs the row in hand to choose between redirecting and
+    // serving an interstitial.
+    const safety = evaluateLinkSafety({
+      isActive: link.is_active,
+      warnAt: link.warn_at,
+      ownerSuspendedAt: link.owner_suspended_at,
+    });
+
+    if (safety === 'block') {
+      // Same response as an unknown code — see evaluateLinkSafety for why.
+      return reply.status(404).send({ error: 'Link not found' });
+    }
+
+    if (safety === 'warn') {
+      // No click is recorded here. A warning view is not a click on the link, and
+      // counting it would silently inflate the owner's analytics.
+      const destination =
+        link.original_url || link.web_fallback_url || link.deep_link_path || '';
+      return reply
+        .status(200)
+        .header('X-Robots-Tag', 'noindex, nofollow')
+        .header('Cache-Control', 'no-store')
+        .type('text/html')
+        .send(generateWarningLinkHTML(destination, { reportUrl: options?.abuseReportUrl }));
+    }
+
+    // Check targeting rules BEFORE redirecting
+    if (link.targeting_rules) {
+      const userAgent = request.headers['user-agent'] || '';
+      const ip = getClientIp(request);
+      const acceptLanguage = request.headers['accept-language'] || '';
+
+      // Get user's actual data for targeting checks
+      const device = detectDevice(userAgent);
+      const { countryCode } = getLocationFromIP(ip);
+
+      // Extract primary language from accept-language header (e.g., "en-US,en;q=0.9" -> "en")
+      const primaryLanguage = acceptLanguage.split(',')[0]?.split('-')[0]?.toLowerCase();
+
+      const rules = link.targeting_rules;
+      let isTargeted = true;
+
+      // Check country targeting
+      if (rules.countries && rules.countries.length > 0) {
+        const targetCountries = rules.countries.map((c: string) => c.toUpperCase());
+        if (!countryCode || !targetCountries.includes(countryCode.toUpperCase())) {
+          isTargeted = false;
+        }
+      }
+
+      // Check device targeting
+      if (rules.devices && rules.devices.length > 0) {
+        if (!rules.devices.includes(device)) {
+          isTargeted = false;
+        }
+      }
+
+      // Check language targeting
+      if (rules.languages && rules.languages.length > 0) {
+        const targetLanguages = rules.languages.map((l: string) => l.toLowerCase());
+        if (!primaryLanguage || !targetLanguages.includes(primaryLanguage)) {
+          isTargeted = false;
+        }
+      }
+
+      // If targeting rules exist but user doesn't match, return 404
+      if (!isTargeted) {
+        return reply.status(404).send({ error: 'Link not found' });
+      }
+    }
+
+    // Generate the click id up front (rather than letting the DB default it on
+    // insert) so the synchronous redirect below can carry it on the destination
+    // URL while the click row is still written asynchronously with the same id.
+    const clickId = randomUUID();
+
+    // Track click asynchronously
+    setImmediate(async () => {
+      try {
+        const userAgent = request.headers['user-agent'] || '';
+        const ip = getClientIp(request);
+        const referrer = request.headers.referer || null;
+        const acceptLanguage = request.headers['accept-language'] || '';
+
+        const deviceType = detectDevice(userAgent);
+        const { platform, platformVersion } = parseUserAgent(userAgent);
+        const { countryCode, countryName, region, city, latitude, longitude, timezone } = getLocationFromIP(ip);
+
+        // Classify bots at ingestion (SIT-298) — persisted on the row so
+        // analytics reads a consistent flag instead of re-detecting from the
+        // stored user-agent.
+        const { isBot, reason: botReason } = classifyBot(
+          userAgent,
+          request.method,
+          edgeBotSignal(request.headers['x-lf-bot'])
+        );
+
+        // Extract UTM parameters from query string
+        const query = request.query as Record<string, string | undefined>;
+        const utmSource = query?.utm_source;
+        const utmMedium = query?.utm_medium;
+        const utmCampaign = query?.utm_campaign;
+
+        // Extract fingerprint data from query params (sent by SDK/client)
+        const fpTimezone = query?.fp_tz || timezone || undefined;
+        const fpLanguage = query?.fp_lang || acceptLanguage.split(',')[0]?.split(';')[0] || undefined;
+        const fpScreenWidth = query?.fp_sw ? parseInt(query.fp_sw, 10) : undefined;
+        const fpScreenHeight = query?.fp_sh ? parseInt(query.fp_sh, 10) : undefined;
+
+        // Insert click event with the pre-generated id (see above) so the row
+        // matches the lf_click value already placed on the redirect URL.
+        await db.query(
+          `INSERT INTO click_events (
+            id, link_id, ip_address, user_agent, device_type, platform,
+            country_code, country_name, region, city, latitude, longitude, timezone,
+            utm_source, utm_medium, utm_campaign, referrer, is_bot, bot_reason
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+          [
+            clickId,
+            link.id,
+            ip,
+            userAgent,
+            deviceType,
+            platform,
+            countryCode,
+            countryName,
+            region,
+            city,
+            latitude,
+            longitude,
+            timezone,
+            utmSource,
+            utmMedium,
+            utmCampaign,
+            referrer,
+            isBot,
+            botReason,
+          ]
+        );
+
+        // Store device fingerprint for deferred deep linking
+        const fingerprintData: FingerprintData = {
+          ipAddress: ip,
+          userAgent,
+          timezone: fpTimezone,
+          language: fpLanguage,
+          screenWidth: fpScreenWidth,
+          screenHeight: fpScreenHeight,
+          platform: deviceType,
+          platformVersion,
+        };
+
+        await storeFingerprintForClick(clickId, fingerprintData);
+
+        // Determine redirect URL for event emission (using same logic as main redirect)
+        // Use the same fallback chain: link → template → workspace
+        const tplSettings = link.template_settings || {};
+        const oSettings = link.org_settings || {};
+        const oAppConfig = oSettings.appConfig || {};
+        const iosStoreUrl = link.ios_app_store_url || tplSettings.defaultIosUrl || oAppConfig.iosAppStoreUrl || null;
+        const androidStoreUrl = link.android_app_store_url || tplSettings.defaultAndroidUrl || oAppConfig.androidAppStoreUrl || null;
+        const webFallback = link.web_fallback_url || tplSettings.defaultWebFallbackUrl || oAppConfig.webFallbackUrl || null;
+
+        let redirectUrl = link.original_url;
+        let redirectReason = 'original_url';
+
+        if (deviceType === 'ios') {
+          if (link.ios_universal_link) {
+            redirectUrl = link.ios_universal_link;
+            redirectReason = 'ios_universal_link';
+          } else if (link.app_scheme && link.deep_link_path) {
+            redirectUrl = `${link.app_scheme}://${link.deep_link_path.replace(/^\//, '')}`;
+            redirectReason = 'app_scheme';
+          } else {
+            const fb = pickMobileFallbackUrl('ios', userAgent, iosStoreUrl, androidStoreUrl, webFallback);
+            if (fb) {
+              redirectUrl = fb.url;
+              redirectReason = fb.reason;
+            }
+          }
+        } else if (deviceType === 'android') {
+          if (link.android_app_link) {
+            redirectUrl = link.android_app_link;
+            redirectReason = 'android_app_link';
+          } else if (link.app_scheme && link.deep_link_path) {
+            redirectUrl = `${link.app_scheme}://${link.deep_link_path.replace(/^\//, '')}`;
+            redirectReason = 'app_scheme';
+          } else {
+            const fb = pickMobileFallbackUrl('android', userAgent, iosStoreUrl, androidStoreUrl, webFallback);
+            if (fb) {
+              redirectUrl = fb.url;
+              redirectReason = fb.reason;
+            }
+          }
+        } else if (deviceType === 'web' && webFallback) {
+          redirectUrl = webFallback;
+          redirectReason = 'web_fallback_url';
+        }
+
+        const finalRedirectUrl = buildRedirectUrl(redirectUrl, link.utm_parameters) || redirectUrl;
+
+        // Emit click event for real-time streaming to WebSocket clients
+        emitClickEvent({
+          eventId: clickId,
+          timestamp: new Date().toISOString(),
+          linkId: link.id,
+          shortCode: link.short_code,
+          userId: link.user_id,
+          ipAddress: ip,
+          userAgent,
+          country: countryCode || undefined,
+          city: city || undefined,
+          deviceType,
+          platform: platform || undefined,
+          redirectUrl: finalRedirectUrl,
+          redirectReason,
+          targetingMatched: true, // If we got here, targeting matched
+          utmParameters: link.utm_parameters || undefined,
+          referer: referrer || undefined,
+          language: fpLanguage,
+        });
+
+        // Trigger webhooks for click_event
+        try {
+          const webhooksResult = await db.query(
+            'SELECT * FROM webhooks WHERE user_id = $1 AND is_active = true',
+            [link.user_id]
+          );
+
+          if (webhooksResult.rows.length > 0) {
+            const { triggerWebhooks } = await import('../lib/webhook.js');
+
+            const clickEventData = {
+              id: clickId,
+              linkId: link.id,
+              clickedAt: new Date().toISOString(),
+              ipAddress: ip,
+              userAgent,
+              deviceType,
+              platform,
+              countryCode,
+              countryName,
+              region,
+              city,
+              latitude,
+              longitude,
+              timezone,
+              utmSource,
+              utmMedium,
+              utmCampaign,
+              referrer,
+            };
+
+            // Trigger webhooks without delivery logging (basic version)
+            // For delivery logging, use @linkforty/cloud premium features
+            await triggerWebhooks(
+              webhooksResult.rows,
+              'click_event',
+              clickId,
+              clickEventData
+            );
+          }
+        } catch (webhookError) {
+          fastify.log.error(`Error triggering click webhooks: ${webhookError}`);
+        }
+      } catch (error) {
+        fastify.log.error(`Error tracking click: ${error}`);
+      }
+    });
+
+    // Determine redirect URL based on device with smart fallback chain
+    // Fallback chain: link URLs → template default URLs → workspace settings URLs
+    const userAgent = request.headers['user-agent'] || '';
+    const device = detectDevice(userAgent);
+
+    // Extract fallback URLs from template settings and org settings
+    const templateSettings = link.template_settings || {};
+    const orgSettings = link.org_settings || {};
+    const orgAppConfig = orgSettings.appConfig || {};
+
+    // Resolve platform URLs with fallback chain: link → template → workspace
+    const iosUrl = link.ios_app_store_url || templateSettings.defaultIosUrl || orgAppConfig.iosAppStoreUrl || null;
+    const androidUrl = link.android_app_store_url || templateSettings.defaultAndroidUrl || orgAppConfig.androidAppStoreUrl || null;
+    const webFallbackUrl = link.web_fallback_url || templateSettings.defaultWebFallbackUrl || orgAppConfig.webFallbackUrl || null;
+
+    let redirectUrl = link.original_url;
+    let useSchemeUrl = false; // Track if we're using a URI scheme URL
+
+    if (device === 'ios') {
+      // iOS Priority:
+      // 1. Universal Link (HTTPS URL with AASA file) — if app installed, OS opens app
+      //    (this branch only runs when UL didn't fire upstream, e.g. in-app browser)
+      // 2. URI scheme (myapp://path) — explicit deep link
+      // 3. Mobile fallback (browser-aware):
+      //    - regular browser: App Store URL > web fallback URL
+      //      (UL would have fired if app installed, so app is not installed)
+      //    - in-app browser: web fallback URL > App Store URL
+      //      (UL was bypassed; web fallback gives UL a second chance to fire)
+      // 4. Original URL — ultimate fallback
+      if (link.ios_universal_link) {
+        redirectUrl = link.ios_universal_link;
+      } else if (link.app_scheme && link.deep_link_path) {
+        // Build URI scheme URL: myapp://product/123
+        redirectUrl = `${link.app_scheme}://${link.deep_link_path.replace(/^\//, '')}`;
+        useSchemeUrl = true;
+      } else {
+        const fb = pickMobileFallbackUrl('ios', userAgent, iosUrl, androidUrl, webFallbackUrl);
+        if (fb) redirectUrl = fb.url;
+      }
+
+    } else if (device === 'android') {
+      // Android Priority — same logic as iOS, with android_app_link in place of UL
+      if (link.android_app_link) {
+        redirectUrl = link.android_app_link;
+      } else if (link.app_scheme && link.deep_link_path) {
+        // Build URI scheme URL: myapp://product/123
+        redirectUrl = `${link.app_scheme}://${link.deep_link_path.replace(/^\//, '')}`;
+        useSchemeUrl = true;
+      } else {
+        const fb = pickMobileFallbackUrl('android', userAgent, iosUrl, androidUrl, webFallbackUrl);
+        if (fb) redirectUrl = fb.url;
+      }
+
+    } else if (device === 'web') {
+      // Web fallback
+      redirectUrl = webFallbackUrl || link.original_url;
+    }
+
+    // If no URL found at all, return a user-friendly error
+    if (!redirectUrl) {
+      return reply.status(404).send({ error: 'No destination URL configured for this link' });
+    }
+
+    // Build final URL with parameters
+    let finalUrl = redirectUrl;
+
+    if (!useSchemeUrl) {
+      // For HTTP(S) URLs, add UTM parameters
+      finalUrl = buildRedirectUrl(redirectUrl, link.utm_parameters) || redirectUrl;
+
+      // Add deep link parameters as query params
+      if (link.deep_link_parameters && Object.keys(link.deep_link_parameters).length > 0) {
+        try {
+          const url = new URL(finalUrl);
+          Object.entries(link.deep_link_parameters).forEach(([key, value]) => {
+            url.searchParams.set(key, String(value));
+          });
+          finalUrl = url.toString();
+        } catch (error) {
+          // If URL parsing fails, continue without deep link parameters
+          console.error('Failed to add deep link parameters:', error);
+        }
+      }
+
+      // When opted in per link (append_click_id), append the originating click id
+      // so a downstream analytics tool on the landing page can correlate the
+      // landing visit to this exact click. Opt-in (default off), web/HTTPS only —
+      // an absent/false flag (incl. stale cache) leaves the destination untouched.
+      if (link.append_click_id === true) {
+        try {
+          const url = new URL(finalUrl);
+          url.searchParams.set('lf_click', clickId);
+          finalUrl = url.toString();
+        } catch {
+          // Non-absolute / unparseable URL — skip the correlation param.
+        }
+      }
+    } else {
+      // For URI scheme URLs, append query params differently
+      if (link.deep_link_parameters && Object.keys(link.deep_link_parameters).length > 0) {
+        const params = new URLSearchParams(
+          Object.entries(link.deep_link_parameters).map(([k, v]) => [k, String(v)] as [string, string])
+        );
+        finalUrl += `?${params.toString()}`;
+      }
+    }
+
+    // Serve an interstitial page for mobile requests when a custom scheme is available.
+    // The interstitial tries to open the app via URI scheme, then falls back to the store.
+    // This works for both in-app browsers (where Universal Links don't fire) and regular
+    // browsers (where a 302 to a custom scheme fails silently if the app isn't installed).
+    // The interstitial JavaScript preserves the URL fragment (E2E encryption key).
+    if ((device === 'ios' || device === 'android') && link.app_scheme) {
+      const deepPath = link.deep_link_path ? link.deep_link_path.replace(/^\//, '') : '';
+      const schemeUrl = link.custom_scheme_url
+        || `${link.app_scheme}://${deepPath}`;
+
+      // The interstitial JS tries the scheme first; storeFallback is what we
+      // navigate to if the scheme doesn't open the app within ~1.5s. Pick it
+      // browser-aware: regular browsers prefer the store URL, in-app browsers
+      // prefer the web fallback (gives UL a second chance to fire).
+      const fb = pickMobileFallbackUrl(device, userAgent, iosUrl, androidUrl, webFallbackUrl);
+      const storeFallback = fb?.url || link.original_url;
+
+      if (storeFallback) {
+        let fullSchemeUrl = schemeUrl;
+        if (link.deep_link_parameters && Object.keys(link.deep_link_parameters).length > 0) {
+          const params = new URLSearchParams(
+            Object.entries(link.deep_link_parameters).map(([k, v]: [string, any]) => [k, String(v)] as [string, string])
+          );
+          fullSchemeUrl += (fullSchemeUrl.includes('?') ? '&' : '?') + params.toString();
+        }
+
+        return reply
+          .header('Content-Type', 'text/html; charset=utf-8')
+          .send(generateInterstitialHTML(fullSchemeUrl, storeFallback, link.title || link.og_title));
+      }
+    }
+
+    // Redirect
+    return reply.redirect(302, finalUrl);
+  }
+
+  // Template-based shortlink route: /:templateSlug/:shortCode
+  fastify.get('/:templateSlug/:shortCode', async (request, reply) => {
+    const { templateSlug, shortCode } = request.params as { templateSlug: string; shortCode: string };
+    return handleRedirect(request, reply, shortCode, templateSlug);
+  });
+
+  // Legacy shortlink route (no template): /:shortCode
+  fastify.get('/:shortCode', async (request, reply) => {
+    const { shortCode } = request.params as { shortCode: string };
+    return handleRedirect(request, reply, shortCode);
+  });
+}

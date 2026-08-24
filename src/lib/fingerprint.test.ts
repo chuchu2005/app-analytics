@@ -1,0 +1,364 @@
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+
+// Mock the database module so tests don't require a real Postgres connection.
+vi.mock('./database', () => ({
+  db: {
+    query: vi.fn(),
+  },
+}));
+
+import * as fingerprint from './fingerprint';
+import { db } from './database';
+
+const mockDbQuery = db.query as Mock;
+
+const baseFingerprint = {
+  ipAddress: '24.5.10.100',
+  userAgent:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36',
+  timezone: 'America/Los_Angeles',
+  language: 'en-US',
+  screenWidth: 1080,
+  screenHeight: 1920,
+  platform: 'Windows',
+  platformVersion: '10',
+};
+
+describe('generateFingerprintHash', () => {
+  it('produces a deterministic 64-character SHA-256 hash', () => {
+    const hash1 = fingerprint.generateFingerprintHash(baseFingerprint);
+    const hash2 = fingerprint.generateFingerprintHash(baseFingerprint);
+
+    expect(hash1).toHaveLength(64);
+    expect(hash1).toBe(hash2);
+  });
+
+  it('produces different hashes for different data', () => {
+    const other = { ...baseFingerprint, ipAddress: '10.0.0.1' };
+    const hash1 = fingerprint.generateFingerprintHash(baseFingerprint);
+    const hash2 = fingerprint.generateFingerprintHash(other);
+
+    expect(hash1).not.toBe(hash2);
+  });
+});
+
+describe('calculateConfidenceScore', () => {
+  it('returns 0 score when nothing matches', () => {
+    const a = { ...baseFingerprint };
+    const b = {
+      ...baseFingerprint,
+      ipAddress: '10.0.0.1',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36',
+      timezone: 'Asia/Tokyo',
+      language: 'ja-JP',
+      screenWidth: 800,
+      screenHeight: 600,
+      platform: 'Macintosh',
+      platformVersion: '11.0',
+    };
+
+    const { score, matchedFactors } = fingerprint.calculateConfidenceScore(a, b);
+
+    expect(score).toBe(0);
+    expect(matchedFactors).toEqual([]);
+  });
+
+  it('matches IP within the same /24 subnet and normalizes user agent', () => {
+    const click = {
+      ...baseFingerprint,
+      ipAddress: '24.5.10.250',
+      timezone: 'Africa/Cairo',
+      language: 'fr-FR',
+      screenWidth: 800,
+      screenHeight: 600,
+      platform: 'Linux',
+    };
+
+    const install = {
+      ...baseFingerprint,
+      ipAddress: '24.5.10.123',
+      userAgent: baseFingerprint.userAgent.replace('Chrome/95.0.4638.69', 'Chrome/116.0.0.0'),
+      timezone: 'Europe/London',
+      language: 'de-DE',
+      screenWidth: 1200,
+      screenHeight: 900,
+      platform: 'Windows',
+    };
+
+    const { score, matchedFactors } = fingerprint.calculateConfidenceScore(click, install);
+
+    expect(score).toBe(70);
+    expect(matchedFactors).toContain('ip');
+    expect(matchedFactors).toContain('user_agent');
+  });
+
+  it('matches language by first two characters', () => {
+    const a = {
+      ...baseFingerprint,
+      ipAddress: '10.0.0.1',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36',
+      timezone: 'Asia/Tokyo',
+      screenWidth: 800,
+      screenHeight: 600,
+      platform: 'Macintosh',
+      platformVersion: '11.0',
+      language: 'en-US',
+    };
+
+    const b = {
+      ...a,
+      ipAddress: '172.16.0.1',
+      userAgent: 'Mozilla/5.0 (Linux; Android 10; SM-G973F) Chrome/91.0.4472.120 Mobile Safari/537.36',
+      timezone: 'UTC',
+      screenWidth: 1024,
+      screenHeight: 768,
+      platform: 'Linux',
+      platformVersion: '10',
+      language: 'en-GB',
+    };
+
+    const { score, matchedFactors } = fingerprint.calculateConfidenceScore(a, b);
+
+    expect(score).toBe(10);
+    expect(matchedFactors).toEqual(['language']);
+  });
+
+  it('matches timezone and resolution', () => {
+    const a = {
+      ...baseFingerprint,
+      ipAddress: '10.0.0.1',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36',
+      language: 'ja-JP',
+      platform: 'Macintosh',
+      platformVersion: '11.0',
+      timezone: 'UTC',
+      screenWidth: 100,
+      screenHeight: 200,
+    };
+
+    const b = {
+      ...a,
+      ipAddress: '172.16.0.1',
+      userAgent: 'Mozilla/5.0 (Linux; Android 10; SM-G973F) Chrome/91.0.4472.120 Mobile Safari/537.36',
+      language: 'fr-FR',
+    };
+
+    const { score, matchedFactors } = fingerprint.calculateConfidenceScore(a, b);
+    expect(score).toBe(20);
+    expect(matchedFactors.sort()).toEqual(['screen', 'timezone'].sort());
+  });
+});
+
+describe('isAttributableIp', () => {
+  it('treats public IPv4 as attributable', () => {
+    expect(fingerprint.isAttributableIp('24.5.10.100')).toBe(true);
+    expect(fingerprint.isAttributableIp('8.8.8.8')).toBe(true);
+  });
+
+  it('rejects CGNAT (100.64.0.0/10) — the Marriage365 case', () => {
+    expect(fingerprint.isAttributableIp('100.64.0.5')).toBe(false);
+    expect(fingerprint.isAttributableIp('100.127.255.254')).toBe(false);
+  });
+
+  it('rejects RFC1918 private, loopback and link-local', () => {
+    expect(fingerprint.isAttributableIp('10.0.0.1')).toBe(false);
+    expect(fingerprint.isAttributableIp('172.16.0.1')).toBe(false);
+    expect(fingerprint.isAttributableIp('192.168.1.1')).toBe(false);
+    expect(fingerprint.isAttributableIp('127.0.0.1')).toBe(false);
+    expect(fingerprint.isAttributableIp('169.254.1.1')).toBe(false);
+  });
+
+  it('handles IPv6: public attributable, ULA/link-local/loopback not', () => {
+    expect(fingerprint.isAttributableIp('2600:1700:6508:8040::1')).toBe(true);
+    expect(fingerprint.isAttributableIp('fd00::1')).toBe(false); // ULA
+    expect(fingerprint.isAttributableIp('fe80::1')).toBe(false); // link-local
+    expect(fingerprint.isAttributableIp('::1')).toBe(false); // loopback
+  });
+
+  it('unwraps IPv4-mapped IPv6 before classifying', () => {
+    expect(fingerprint.isAttributableIp('::ffff:100.64.0.5')).toBe(false);
+    expect(fingerprint.isAttributableIp('::ffff:24.5.10.100')).toBe(true);
+  });
+
+  it('returns false for empty/garbage input', () => {
+    expect(fingerprint.isAttributableIp('')).toBe(false);
+    expect(fingerprint.isAttributableIp('not-an-ip')).toBe(false);
+  });
+});
+
+describe('calculateConfidenceScore — shared-IP filter', () => {
+  it('does NOT award the IP score for two devices sharing a CGNAT /24', () => {
+    // Exactly the Marriage365 leak: unrelated installs collapsing onto 100.64.0.x.
+    const click = { ...baseFingerprint, ipAddress: '100.64.0.5' };
+    const install = { ...baseFingerprint, ipAddress: '100.64.0.9' };
+
+    const { score, matchedFactors } = fingerprint.calculateConfidenceScore(click, install);
+
+    expect(matchedFactors).not.toContain('ip');
+    // UA(30)+TZ(10)+lang(10)+screen(10) = 60, below the 70 threshold → no match.
+    expect(score).toBe(60);
+    expect(score).toBeLessThan(fingerprint.CONFIDENCE_THRESHOLD);
+  });
+
+  it('still awards the IP score for two devices sharing a public /24', () => {
+    const click = { ...baseFingerprint, ipAddress: '24.5.10.5' };
+    const install = { ...baseFingerprint, ipAddress: '24.5.10.9' };
+
+    const { matchedFactors } = fingerprint.calculateConfidenceScore(click, install);
+    expect(matchedFactors).toContain('ip');
+  });
+});
+
+describe('matchInstallToClick', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2025-01-01T00:00:00Z'));
+    mockDbQuery.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns null when there are no click rows', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+
+    const result = await fingerprint.matchInstallToClick(baseFingerprint);
+    expect(result).toBeNull();
+  });
+
+  it('returns the best match above the confidence threshold', async () => {
+    const clickTime = new Date('2024-12-31T23:00:00Z');
+
+    // First row: only IP match (score 40)
+    const rowA = {
+      click_id: 'click-a',
+      link_id: 'link-a',
+      clicked_at: clickTime.toISOString(),
+      attribution_window_hours: 24,
+      ip_address: '24.5.10.200',
+      user_agent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36',
+      timezone: 'Asia/Tokyo',
+      language: 'ja-JP',
+      screen_width: 720,
+      screen_height: 1280,
+      platform: 'Macintosh',
+      platform_version: '11.0',
+    };
+
+    // Second row: IP + user agent + timezone + language + screen (score 100)
+    const rowB = {
+      click_id: 'click-b',
+      link_id: 'link-b',
+      clicked_at: clickTime.toISOString(),
+      attribution_window_hours: 24,
+      ip_address: '24.5.10.250',
+      user_agent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+      timezone: 'America/Los_Angeles',
+      language: 'en-US',
+      screen_width: 1080,
+      screen_height: 1920,
+      platform: 'Windows',
+      platform_version: '10',
+    };
+
+    mockDbQuery.mockResolvedValueOnce({ rows: [rowA, rowB] });
+
+    const installFingerprint = {
+      ...baseFingerprint,
+      ipAddress: '24.5.10.123',
+      userAgent: baseFingerprint.userAgent.replace('Chrome/95.0.4638.69', 'Chrome/116.0.0.0'),
+    };
+
+    const result = await fingerprint.matchInstallToClick(installFingerprint);
+
+    expect(result).not.toBeNull();
+    expect(result?.clickId).toBe('click-b');
+    expect(result?.confidenceScore).toBe(100);
+    expect(result?.matchedFactors).toEqual(expect.arrayContaining(['ip', 'user_agent', 'timezone', 'language', 'screen']));
+  });
+
+  it('skips clicks that are outside the attribution window', async () => {
+    const oldClickTime = new Date('2024-01-01T00:00:00Z');
+
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          click_id: 'click-old',
+          link_id: 'link-old',
+          clicked_at: oldClickTime.toISOString(),
+          attribution_window_hours: 1,
+          ip_address: baseFingerprint.ipAddress,
+          user_agent: baseFingerprint.userAgent,
+          timezone: baseFingerprint.timezone,
+          language: baseFingerprint.language,
+          screen_width: baseFingerprint.screenWidth,
+          screen_height: baseFingerprint.screenHeight,
+          platform: baseFingerprint.platform,
+          platform_version: baseFingerprint.platformVersion,
+        },
+      ],
+    });
+
+    const result = await fingerprint.matchInstallToClick(baseFingerprint);
+    expect(result).toBeNull();
+  });
+});
+
+describe('recordInstallEvent', () => {
+  beforeEach(() => {
+    mockDbQuery.mockReset();
+  });
+
+  it('inserts an install event and returns the install id when no match is found', async () => {
+    // matchInstallToClick is invoked internally by recordInstallEvent.
+    // The first db query is used to find click events. Return an empty list to force a null match.
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ id: 'install-123', deep_link_data: {} }] });
+
+    const result = await fingerprint.recordInstallEvent(baseFingerprint, 'device-1');
+
+    expect(result.installId).toBe('install-123');
+    expect(result.match).toBeNull();
+    expect(result.deepLinkData).toEqual({});
+
+    expect(mockDbQuery).toHaveBeenCalledTimes(2);
+    expect(mockDbQuery).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.arrayContaining([null, null, expect.any(String), null, expect.any(String), expect.any(String), null, null, null, null, null, null, null, 'device-1', null])
+    );
+  });
+
+  it('forwards sdk name + version as the last two positional params of the install insert (guards column misalignment)', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] }); // matchInstallToClick -> no match
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ id: 'install-456', deep_link_data: {} }] });
+
+    await fingerprint.recordInstallEvent(baseFingerprint, 'device-1', undefined, {
+      name: 'react-native',
+      version: '1.4.0',
+    });
+
+    const [sql, params] = mockDbQuery.mock.calls[1];
+    expect(sql).toMatch(/INSERT INTO install_events/);
+    expect(sql).toMatch(/sdk_name/);
+    expect(sql).toMatch(/sdk_version/);
+    // sdk_name/$16, sdk_version/$17, then attribution_method/$18, matched_factors/$19
+    expect(params).toHaveLength(19);
+    expect(params[15]).toBe('react-native'); // sdk_name
+    expect(params[16]).toBe('1.4.0');        // sdk_version
+    expect(params[17]).toBe('none');         // attribution_method (no fingerprint match)
+    expect(params[18]).toBeNull();           // matched_factors (no match)
+  });
+
+  it('stores null sdk on the install row when the metadata is absent or empty', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ id: 'install-789', deep_link_data: {} }] });
+
+    await fingerprint.recordInstallEvent(baseFingerprint, 'device-1', undefined, { name: '', version: undefined });
+
+    const params = mockDbQuery.mock.calls[1][1];
+    expect(params[15]).toBeNull(); // sdk_name '' -> null
+    expect(params[16]).toBeNull(); // sdk_version undefined -> null
+  });
+});

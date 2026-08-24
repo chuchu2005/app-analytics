@@ -1,0 +1,84 @@
+import Fastify, { FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
+import redis from '@fastify/redis';
+import { initializeDatabase, DatabaseOptions } from './lib/database.js';
+import { redirectRoutes } from './routes/redirect.js';
+import { linkRoutes } from './routes/links.js';
+import { analyticsRoutes } from './routes/analytics.js';
+import { sdkRoutes } from './routes/sdk.js';
+import { webhookRoutes } from './routes/webhooks.js';
+import { templateRoutes } from './routes/templates.js';
+import { qrRoutes } from './routes/qr.js';
+import { wellKnownRoutes } from './routes/well-known.js';
+import { healthRoutes } from './routes/health.js';
+
+/**
+ * Configuration options for creating a LinkForty server instance.
+ */
+export interface ServerOptions {
+  database?: DatabaseOptions;
+  redis?: {
+    url: string;
+  };
+  cors?: {
+    origin: string | string[];
+  };
+  logger?: boolean;
+  /** When true or a number (proxy hop count), Fastify trusts X-Forwarded-For so request.ip is the real client IP. Set when behind a reverse proxy. */
+  trustProxy?: boolean | number;
+}
+
+/**
+ * Create and configure a LinkForty Fastify server instance.
+ *
+ * Registers CORS, optional Redis, the database connection, and all built-in
+ * route plugins. The returned instance is ready to call `listen()` on.
+ *
+ * @param options - Server configuration (database, Redis, CORS, logger).
+ * @returns A configured Fastify instance with all routes registered.
+ */
+export async function createServer(options: ServerOptions = {}) {
+  const fastify = Fastify({
+    logger: options.logger !== undefined ? options.logger : true,
+    trustProxy: options.trustProxy,
+  });
+
+  // CORS
+  await fastify.register(cors, {
+    origin: options.cors?.origin || '*',
+  });
+
+  // Redis (optional)
+  if (options.redis?.url) {
+    await fastify.register(redis, {
+      url: options.redis.url,
+    });
+  }
+
+  // Database
+  await initializeDatabase(options.database);
+
+  // Routes
+  await fastify.register(healthRoutes);
+  await fastify.register(wellKnownRoutes);
+  await fastify.register(redirectRoutes);
+  await fastify.register(linkRoutes);
+  await fastify.register(analyticsRoutes);
+  await fastify.register(sdkRoutes);
+  await fastify.register(webhookRoutes);
+  await fastify.register(templateRoutes);
+  await fastify.register(qrRoutes);
+
+  return fastify;
+}
+
+// Re-export utilities and types
+export * from './lib/utils.js';
+export * from './lib/client-ip.js';
+export * from './lib/database.js';
+export * from './lib/fingerprint.js';
+export * from './lib/webhook.js';
+export * from './lib/link-safety.js';
+export * from './lib/event-emitter.js';
+export * from './types/index.js';
+export { redirectRoutes, linkRoutes, analyticsRoutes, sdkRoutes, webhookRoutes, templateRoutes, qrRoutes, previewRoutes, debugRoutes, wellKnownRoutes, healthRoutes } from './routes/index.js';
